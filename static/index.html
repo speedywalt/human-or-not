@@ -1,1 +1,136 @@
-placeholder
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Human or Not?</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- LOBBY / JOIN SCREEN -->
+    <div id="screen-join" class="screen">
+      <div class="card">
+        <h1>🧠 Human or Not?</h1>
+        <p class="subtitle">Spot the human drawing. Spot the AI player.</p>
+
+        <div class="tabs">
+          <button id="tab-create" class="tab active">Create Room</button>
+          <button id="tab-join" class="tab">Join Room</button>
+        </div>
+
+        <div id="panel-create" class="panel">
+          <input id="create-name" type="text" placeholder="Your name" maxlength="20" />
+          <button id="btn-create" class="primary">Create Room</button>
+        </div>
+
+        <div id="panel-join" class="panel hidden">
+          <input id="join-code" type="text" placeholder="Room code" maxlength="5" style="text-transform:uppercase" />
+          <input id="join-name" type="text" placeholder="Your name" maxlength="20" />
+          <button id="btn-join" class="primary">Join Room</button>
+        </div>
+
+        <p id="join-error" class="error"></p>
+      </div>
+    </div>
+
+    <!-- GAME SCREEN -->
+    <div id="screen-game" class="screen hidden">
+      <header>
+        <div class="logo">Human or Not?</div>
+        <div class="room-info">
+          Room <span id="room-code" class="code"></span>
+          <span id="phase-badge" class="badge">Lobby</span>
+        </div>
+        <div id="player-list" class="player-list"></div>
+      </header>
+
+      <main>
+        <!-- LOBBY PHASE -->
+        <section id="phase-lobby" class="phase">
+          <h2>Waiting for players…</h2>
+          <p>Share the room code with your mates. 3–6 players recommended.</p>
+          <div class="actions">
+            <button id="btn-add-ai" class="secondary">Add AI Player</button>
+            <button id="btn-start" class="primary">Start Round</button>
+          </div>
+          <p class="hint">Only the host can start the round or add the AI.</p>
+        </section>
+
+        <!-- DRAWING PHASE -->
+        <section id="phase-drawing" class="phase hidden">
+          <h2>🎨 Drawing Time</h2>
+          <p class="prompt" id="draw-prompt"></p>
+          <div id="artist-only" class="hidden">
+            <p>You are the <strong>Artist</strong>! Draw the prompt and upload it.</p>
+            <input type="file" id="image-upload" accept="image/*" />
+            <button id="btn-upload" class="primary">Upload Drawing</button>
+            <p id="upload-status"></p>
+          </div>
+          <div id="waiting-artist">
+            <p>Waiting for the artist to upload their drawing…</p>
+            <div class="spinner"></div>
+          </div>
+        </section>
+
+        <!-- DISCUSSION / VOTING / REVEAL -->
+        <section id="phase-discussion" class="phase hidden">
+          <div class="images-row">
+            <div class="image-card" id="img-A">
+              <div class="label">Image A</div>
+              <img id="src-A" src="" alt="Image A" />
+            </div>
+            <div class="image-card" id="img-B">
+              <div class="label">Image B</div>
+              <img id="src-B" src="" alt="Image B" />
+            </div>
+          </div>
+
+          <p class="prompt-small" id="disc-prompt"></p>
+
+          <div class="chat-area">
+            <div id="chat-log" class="chat-log"></div>
+            <div class="chat-input">
+              <input id="chat-text" type="text" placeholder="Say something…" maxlength="300" />
+              <button id="btn-send">Send</button>
+            </div>
+          </div>
+
+          <div id="vote-panel" class="vote-panel hidden">
+            <h3>Vote!</h3>
+            <div class="vote-row">
+              <label>Which image is human-made?</label>
+              <div class="vote-btns">
+                <button data-image="A" class="vote-img">Image A</button>
+                <button data-image="B" class="vote-img">Image B</button>
+              </div>
+            </div>
+            <div class="vote-row">
+              <label>Who is the AI? (or the Artist)</label>
+              <div id="vote-players" class="vote-btns"></div>
+            </div>
+            <button id="btn-submit-vote" class="primary" disabled>Submit Vote</button>
+          </div>
+
+          <div id="host-controls" class="actions hidden">
+            <button id="btn-voting" class="secondary">Open Voting</button>
+            <button id="btn-reveal" class="secondary">Force Reveal</button>
+            <button id="btn-next" class="primary hidden">Next Round</button>
+          </div>
+        </section>
+
+        <!-- REVEAL -->
+        <section id="phase-reveal" class="phase hidden">
+          <h2>🔍 Reveal</h2>
+          <div id="reveal-content"></div>
+          <div class="actions">
+            <button id="btn-next2" class="primary">Back to Lobby</button>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
