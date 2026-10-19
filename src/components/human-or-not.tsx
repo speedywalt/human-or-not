@@ -8,7 +8,7 @@ import { SignedIn, SignedOut, UserButton } from "@/lib/auth/gates";
 import { useP2PRoom } from "@/lib/multiplayer/use-p2p-room";
 
 type Phase = "lobby" | "drawing" | "vote" | "results";
-type Mode = "classic" | "same" | "blitz" | "studio" | "countries" | "team" | "imposter";
+type Mode = "classic" | "same" | "blitz" | "studio" | "countries" | "team" | "imposter" | "blend";
 type Ballot = { image: "A" | "B" };
 type Player = { id: string; name: string };
 type ChatLine = { id: string; from: string; text: string; system?: boolean };
@@ -44,12 +44,16 @@ type Snap = {
   kicks: Record<string, string>;
   kicked: string;
   winner: "" | "humans" | "ai";
+  blendId: string;
+  board: string;
 };
 type NetMsg =
   | { t: "snap"; snap: Snap }
   | { t: "ink"; playerId: string; png: string }
   | { t: "vote"; image: "A" | "B" }
   | { t: "kick"; target: string }
+  | { t: "blend"; target: string }
+  | { t: "line"; png: string }
   | { t: "chat"; text: string }
   | { t: "studio"; promptIndex: number; png: string };
 
@@ -72,6 +76,7 @@ const MODES: { id: Mode; label: string; hint: string }[] = [
   { id: "studio", label: "Studio", hint: "A real AI drawing" },
   { id: "countries", label: "Countries", hint: "Draw the real border" },
   { id: "imposter", label: "Imposter", hint: "Fake names. Vote one out." },
+  { id: "blend", label: "Blend", hint: "One line each. One of you is blind." },
 ];
 const FAKE = "fake";
 const ALIASES = [
@@ -96,6 +101,7 @@ const ALIASES = [
 ];
 const TEAM_KEY = "__humans";
 const SCRIB_KEY = "__scrib";
+const BLEND_SECONDS = 20;
 const DIFFICULTIES: { id: Difficulty; label: string; hint: string }[] = [
   { id: "easy", label: "Easy", hint: "Obvious" },
   { id: "medium", label: "Medium", hint: "Shaky" },
@@ -167,6 +173,15 @@ function dealAliases(players: Player[]) {
   return aliases;
 }
 
+function blendSeating(players: Player[]) {
+  const bag = shuffle(players);
+  const imposter = bag[Math.floor(Math.random() * bag.length)]!;
+  const rest = bag.filter((player) => player.id !== imposter.id);
+  const index = 1 + Math.floor(Math.random() * rest.length);
+  const order = [...rest.slice(0, index), imposter, ...rest.slice(index)];
+  return { order, imposter };
+}
+
 function answerSide(mode: Mode, humanSide: "A" | "B"): "A" | "B" {
   if (mode === "countries" || mode === "team") return humanSide === "A" ? "B" : "A";
   return humanSide;
@@ -217,6 +232,24 @@ function exportDrawing(canvas: HTMLCanvasElement) {
   return out.toDataURL("image/jpeg", 0.55);
 }
 
+function outgoingSnap(snap: Snap, peerId: string): Snap {
+  if (snap.mode !== "blend" || !snap.blendId) return snap;
+  const prompt = Object.values(snap.topics).find((n) => n >= 0) ?? 0;
+  const blind = peerId === snap.blendId;
+  const open = snap.revealed || snap.phase === "results";
+  const topics: Record<string, number> = {};
+  for (const id of Object.keys(snap.topics)) topics[id] = !open && blind ? -1 : prompt;
+  return { ...snap, topics, blendId: open || blind ? snap.blendId : "" };
+}
+
+function publishSnap(send: (data: unknown, peerId?: string) => void, peers: { id: string }[], snap: Snap) {
+  if (snap.mode === "blend" && snap.blendId) {
+    for (const peer of peers) send({ t: "snap", snap: outgoingSnap(snap, peer.id) }, peer.id);
+    return;
+  }
+  send({ t: "snap", snap });
+}
+
 function lobbySnap(
   hostId: string,
   mode: Mode,
@@ -249,6 +282,8 @@ function lobbySnap(
     kicks: {},
     kicked: "",
     winner: "",
+    blendId: "",
+    board: "",
   };
 }
 
@@ -418,11 +453,17 @@ function Room({
   const [pickKick, setPickKick] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [copied, setCopied] = useState(false);
+  const [startNote, setStartNote] = useState("");
+  const [lineSent, setLineSent] = useState(false);
   const timerBeforeBlitz = useRef(90);
   const snapRef = useRef<Snap | null>(null);
   const inksRef = useRef<Record<string, string>>({});
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawing = useRef(false);
+  const moved = useRef(false);
+  const strokeLock = useRef(false);
+  const armed = useRef(false);
+  const blendSlot = useRef(-1);
   const sent = useRef(false);
   const finishing = useRef(false);
   const idleFinish = useRef<number | null>(null);
@@ -456,7 +497,7 @@ function Room({
   function publish(next: Snap) {
     snapRef.current = next;
     setSnap(next);
-    p2p.send({ t: "snap", snap: next });
+    publishSnap(p2p.send, p2p.peers, next);
   }
 
   function pushSetup(partial: Partial<Pick<Snap, "mode" | "difficulty" | "timerOn" | "timerSeconds" | "commentsOn">>) {
@@ -485,7 +526,7 @@ function Room({
       comments = true;
       setCommentsOn(true);
     }
-    if (next === "imposter") {
+    if (next === "imposter" || next === "blend") {
       comments = false;
       setCommentsOn(false);
     }
@@ -719,6 +760,8 @@ function Room({
       if (!host || !snapRef.current) return;
       if (msg.t === "vote") applyVote(snapRef.current, from, msg.image);
       if (msg.t === "kick") applyKick(snapRef.current, from, msg.target);
+      if (msg.t === "blend") applyBlend(snapRef.current, from, msg.target);
+      if (msg.t === "line") acceptLine(snapRef.current, from, msg.png);
       if (msg.t === "chat") {
         const text = msg.text.trim().slice(0, 240);
         const current = snapRef.current;
@@ -750,13 +793,13 @@ function Room({
     for (const [index, png] of Object.entries(studioRef.current)) {
       p2p.send({ t: "studio", promptIndex: Number(index), png });
     }
-    if (snapRef.current) p2p.send({ t: "snap", snap: snapRef.current });
+    if (snapRef.current) publishSnap(p2p.send, p2p.peers, snapRef.current);
   }, [host, p2p.peers, p2p.send]);
 
   useEffect(() => {
     if (!host) return;
     const current = snapRef.current;
-    if (!current || current.phase !== "drawing" || current.mode === "imposter") return;
+    if (!current || current.phase !== "drawing" || current.mode === "imposter" || current.mode === "blend") return;
     const missing = roster.filter((player) => !current.order.some((entry) => entry.id === player.id));
     if (missing.length === 0) return;
     const shared = current.mode === "same" || current.mode === "studio" || current.mode === "team";
@@ -788,8 +831,55 @@ function Room({
     if (snap?.phase !== "drawing") return;
     sent.current = false;
     const canvas = canvasRef.current;
-    if (canvas) blankCanvas(canvas);
+    if (canvas && snap.mode !== "blend") blankCanvas(canvas);
   }, [snap?.phase, snap?.round]);
+
+  useEffect(() => {
+    if (snap?.mode !== "blend" || snap.phase !== "drawing") return;
+    sent.current = false;
+    strokeLock.current = false;
+    armed.current = false;
+    setLineSent(false);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let cancel = false;
+    blankCanvas(canvas);
+    const src = snap.board;
+    if (!src) {
+      armed.current = true;
+      return;
+    }
+    const img = new Image();
+    img.onload = () => {
+      if (cancel) return;
+      const ctx = canvas.getContext("2d");
+      if (ctx) ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      armed.current = true;
+    };
+    img.onerror = () => {
+      if (!cancel) armed.current = true;
+    };
+    img.src = src;
+    return () => {
+      cancel = true;
+    };
+  }, [snap?.mode, snap?.phase, snap?.slot, snap?.round, snap?.board]);
+
+  useEffect(() => {
+    if (!host || snap?.mode !== "blend" || snap.phase !== "drawing" || !snap.deadline) return;
+    const slot = snap.slot;
+    const wait = Math.max(0, snap.deadline - Date.now()) + 300;
+    const id = window.setTimeout(() => {
+      const current = snapRef.current;
+      if (!current || current.mode !== "blend" || current.phase !== "drawing" || current.slot !== slot) return;
+      const turn = current.order[current.slot % current.order.length];
+      if (!turn) return;
+      acceptLine(current, turn.id, "");
+    }, wait);
+    return () => window.clearTimeout(id);
+    // Turn clock. A missed line passes the picture on as it is.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [host, snap?.mode, snap?.phase, snap?.slot, snap?.deadline]);
 
   useEffect(() => {
     if (snap?.phase !== "drawing" || !snap.deadline) return;
@@ -800,7 +890,7 @@ function Room({
   }, [snap?.phase, snap?.deadline]);
 
   useEffect(() => {
-    if (snap?.phase !== "drawing" || !snap.deadline) return;
+    if (snap?.phase !== "drawing" || !snap.deadline || snap.mode === "blend") return;
     const end = snap.deadline;
     const timers = [0, 1600].map((extra) =>
       window.setTimeout(() => {
@@ -813,7 +903,7 @@ function Room({
   }, [snap?.phase, snap?.round, snap?.deadline]);
 
   useEffect(() => {
-    if (!host || snap?.phase !== "drawing" || !snap.deadline) return;
+    if (!host || snap?.phase !== "drawing" || !snap.deadline || snap.mode === "blend") return;
     const wait = Math.max(0, snap.deadline - Date.now()) + 2800;
     const id = window.setTimeout(() => {
       const current = snapRef.current;
@@ -879,9 +969,15 @@ function Room({
   }
 
   function onDown(e: React.PointerEvent<HTMLCanvasElement>) {
+    const current = snapRef.current;
+    if (current?.mode === "blend") {
+      const turn = current.order[current.slot % current.order.length];
+      if (!armed.current || strokeLock.current || sent.current || turn?.id !== p2p.selfId) return;
+    }
     const canvas = e.currentTarget;
     canvas.setPointerCapture(e.pointerId);
     drawing.current = true;
+    moved.current = false;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.strokeStyle = "#f4efe6";
@@ -894,18 +990,25 @@ function Room({
   }
 
   function onMove(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (!drawing.current) return;
+    if (!drawing.current || strokeLock.current) return;
     const canvas = e.currentTarget;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const p = pointerPos(canvas, e);
     ctx.lineTo(p.x, p.y);
     ctx.stroke();
+    moved.current = true;
   }
 
   function onUp(e: React.PointerEvent<HTMLCanvasElement>) {
+    const blend = snapRef.current?.mode === "blend";
+    const did = drawing.current && moved.current;
     drawing.current = false;
     if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+    if (blend && did) {
+      strokeLock.current = true;
+      sendLine();
+    }
   }
 
   function sendDrawing() {
@@ -918,6 +1021,62 @@ function Room({
     sent.current = true;
     noteInk(p2p.selfId, png);
     p2p.send({ t: "ink", playerId: p2p.selfId, png });
+  }
+
+  function sendLine() {
+    const canvas = canvasRef.current;
+    const current = snapRef.current;
+    if (!canvas || !current || current.mode !== "blend" || current.phase !== "drawing") return;
+    const turn = current.order[current.slot % current.order.length];
+    if (!turn || turn.id !== p2p.selfId || sent.current) return;
+    const png = exportDrawing(canvas);
+    if (!png) return;
+    sent.current = true;
+    setLineSent(true);
+    if (host) acceptLine(current, p2p.selfId, png);
+    else p2p.send({ t: "line", png });
+  }
+
+  function acceptLine(base: Snap, from: string, png: string) {
+    if (!host || base.mode !== "blend" || base.phase !== "drawing") return;
+    if (blendSlot.current === base.slot) return;
+    const turn = base.order[base.slot % base.order.length];
+    if (!turn || turn.id !== from) return;
+    blendSlot.current = base.slot;
+    const board = png || base.board;
+    const slot = base.slot + 1;
+    if (slot >= base.order.length) {
+      publish({ ...base, board, slot, phase: "vote", revealed: false, kicks: {}, deadline: null });
+      return;
+    }
+    publish({ ...base, board, slot, deadline: Date.now() + BLEND_SECONDS * 1000 });
+  }
+
+  function applyBlend(base: Snap, voterId: string, target: string) {
+    if (base.mode !== "blend" || base.phase !== "vote" || base.revealed) return;
+    if (!base.order.some((player) => player.id === voterId)) return;
+    if (voterId === target || base.kicks[voterId]) return;
+    if (!base.order.some((player) => player.id === target)) return;
+    const kicks = { ...base.kicks, [voterId]: target };
+    const next = { ...base, kicks };
+    if (base.order.every((player) => kicks[player.id])) revealBlend(next);
+    else publish(next);
+  }
+
+  function revealBlend(base: Snap) {
+    const scores = { ...base.scores };
+    const others = base.order.filter((player) => player.id !== base.blendId);
+    let hits = 0;
+    for (const [id, target] of Object.entries(base.kicks)) {
+      if (id === base.blendId) continue;
+      if (target === base.blendId) {
+        hits += 1;
+        scores[id] = (scores[id] ?? 0) + 2;
+      }
+    }
+    const caught = hits * 2 > others.length;
+    if (!caught && base.blendId) scores[base.blendId] = (scores[base.blendId] ?? 0) + 3;
+    publish({ ...base, revealed: true, scores, winner: caught ? "humans" : "ai" });
   }
 
   function startRound() {
@@ -976,6 +1135,54 @@ function Room({
         kicks: {},
         kicked: "",
         winner: "",
+        blendId: "",
+        board: "",
+      });
+      return;
+    }
+    if (mode === "blend") {
+      if (roster.length < 2) {
+        setStartNote("Blend needs 2 players.");
+        return;
+      }
+      setStartNote("");
+      const { order, imposter } = blendSeating(roster);
+      const prompt = dealPrompts(1)[0] ?? 0;
+      const topics: Record<string, number> = {};
+      for (const player of order) topics[player.id] = player.id === imposter.id ? -1 : prompt;
+      blendSlot.current = -1;
+      inksRef.current = {};
+      setInks({});
+      sent.current = false;
+      setLineSent(false);
+      strokeLock.current = false;
+      finishing.current = false;
+      publish({
+        hostId: p2p.selfId,
+        phase: "drawing",
+        round: (prev?.round ?? 0) + 1,
+        mode,
+        difficulty,
+        timerOn: true,
+        timerSeconds: BLEND_SECONDS,
+        commentsOn: false,
+        deadline: Date.now() + BLEND_SECONDS * 1000,
+        order,
+        topics,
+        pairs: [],
+        slot: 0,
+        revealed: false,
+        votes: {},
+        scores: prev?.mode === "blend" ? prev.scores : {},
+        chat: [],
+        aiName: prev?.aiName ?? "Alex",
+        aliases: {},
+        eliminated: [],
+        kicks: {},
+        kicked: "",
+        winner: "",
+        blendId: imposter.id,
+        board: "",
       });
       return;
     }
@@ -1016,6 +1223,8 @@ function Room({
       kicks: {},
       kicked: "",
       winner: "",
+      blendId: "",
+      board: "",
     });
   }
 
@@ -1056,6 +1265,14 @@ function Room({
     setPickKick(target);
   }
 
+  function castBlend(target: string) {
+    if (!snap || snap.mode !== "blend" || snap.phase !== "vote" || snap.revealed) return;
+    if (!snap.order.some((player) => player.id === p2p.selfId) || target === p2p.selfId) return;
+    if (host) applyBlend(snap, p2p.selfId, target);
+    else p2p.send({ t: "blend", target });
+    setPickKick(target);
+  }
+
   const phase = snap?.phase ?? "lobby";
   const hostName = roster.find((player) => player.id === (snap?.hostId ?? (host ? p2p.selfId : "")))?.name;
 
@@ -1078,9 +1295,11 @@ function Room({
         <section className="flex min-h-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-y-auto rounded-card border border-line bg-surface p-4">
             <h2 className="font-display text-2xl">{host ? "Lobby" : "You're in"}</h2>
-            <div className="mt-2">
-              <ScribSay {...scribLobby(host, scribSeed(room, name))} />
-            </div>
+            {(host ? mode : (snap?.mode ?? mode)) === "classic" && (
+              <div className="mt-2">
+                <ScribSay {...scribLobby(host, scribSeed(room, name))} />
+              </div>
+            )}
             <p className="mt-1 text-sm text-muted">
               {host ? "Share the code so friends can join." : `Waiting for ${hostName || "the host"} to start.`}
             </p>
@@ -1112,6 +1331,11 @@ function Room({
                 <ModePicker mode={mode} onPick={chooseMode} />
                 {mode === "imposter" && (
                   <p className="mt-2 text-sm text-muted">Names vanish at the start. Needs 2 players. Nobody talks.</p>
+                )}
+                {mode === "blend" && (
+                  <p className="mt-2 text-sm text-muted">
+                    Same prompt, hidden from one player. One line each, in turn. They have to blend in. Needs 2.
+                  </p>
                 )}
                 {mode === "studio" && (
                   <div className="mt-2">
@@ -1163,18 +1387,34 @@ function Room({
             )}
           </div>
           {host && (
-            <button
-              type="button"
-              onClick={startRound}
-              className="mt-3 shrink-0 self-start rounded-xl bg-accent px-5 py-3 text-sm font-semibold text-accent-ink"
-            >
-              Start round
-            </button>
+            <div className="mt-3 shrink-0">
+              {startNote && <p className="mb-2 text-sm text-muted">{startNote}</p>}
+              <button
+                type="button"
+                onClick={startRound}
+                className="rounded-xl bg-accent px-5 py-3 text-sm font-semibold text-accent-ink"
+              >
+                Start round
+              </button>
+            </div>
           )}
         </section>
       )}
 
-      {phase === "drawing" && snap && (
+      {phase === "drawing" && snap && snap.mode === "blend" && (
+        <BlendDraw
+          snap={snap}
+          selfId={p2p.selfId}
+          timeLeft={timeLeft}
+          lineSent={lineSent}
+          canvasRef={canvasRef}
+          onDown={onDown}
+          onMove={onMove}
+          onUp={onUp}
+        />
+      )}
+
+      {phase === "drawing" && snap && snap.mode !== "blend" && (
         <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-card border border-line bg-surface p-4">
           <div className="flex items-end justify-between gap-3">
             <div>
@@ -1204,9 +1444,11 @@ function Room({
           </div>
           {mine ? (
             <>
-              <div className="mt-2">
-                <ScribSay {...scribDraw(snap.mode === "countries", scribSeed(snap.round, name), snap.mode === "team")} />
-              </div>
+              {snap.mode === "classic" && (
+                <div className="mt-2">
+                  <ScribSay {...scribDraw(false, scribSeed(snap.round, name))} />
+                </div>
+              )}
               <p className="mt-1 text-xs text-muted">
                 {snap.mode === "imposter" ? "No names. No talking. " : ""}
                 {sent.current
@@ -1265,7 +1507,18 @@ function Room({
         />
       )}
 
-      {phase === "vote" && snap && pair && snap.mode !== "imposter" && (
+      {phase === "vote" && snap?.mode === "blend" && (
+        <BlendVote
+          snap={snap}
+          selfId={p2p.selfId}
+          pick={pickKick}
+          onPick={castBlend}
+          host={host}
+          onScores={() => publish({ ...snap, phase: "results" })}
+        />
+      )}
+
+      {phase === "vote" && snap && pair && snap.mode !== "imposter" && snap.mode !== "blend" && (
         <section className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
           <VoteBoard snap={snap} pair={pair} selfId={p2p.selfId} />
           <div className="grid min-h-0 flex-1 grid-cols-2 gap-2">
@@ -1369,14 +1622,15 @@ function Room({
 
           {!snap.revealed && (
             <div className="flex shrink-0 items-center justify-between gap-3">
-              <ScribSay
-                {...scribVote(
-                  p2p.selfId === pair.playerId,
-                  Boolean(snap.votes[pair.playerId]?.[p2p.selfId] ?? pickImage),
-                  scribSeed(snap.round, snap.slot, name),
-                  snap.mode === "team",
-                )}
-              />
+              {snap.mode === "classic" && (
+                <ScribSay
+                  {...scribVote(
+                    p2p.selfId === pair.playerId,
+                    Boolean(snap.votes[pair.playerId]?.[p2p.selfId] ?? pickImage),
+                    scribSeed(snap.round, snap.slot, name),
+                  )}
+                />
+              )}
               {host && (
                 <button type="button" onClick={() => reveal(snap)} className="shrink-0 text-sm text-muted underline">
                   Reveal
@@ -1390,16 +1644,17 @@ function Room({
 
           {snap.revealed && (
             <div className="shrink-0">
-              <ScribSay
-                {...scribReveal(
-                  p2p.selfId === pair.playerId,
-                  Boolean(snap.votes[pair.playerId]?.[p2p.selfId]),
-                  snap.votes[pair.playerId]?.[p2p.selfId]?.image === answerSide(snap.mode, pair.humanSide),
-                  name,
-                  scribSeed(snap.round, snap.slot, name, "reveal"),
-                  snap.mode === "team",
-                )}
-              />
+              {snap.mode === "classic" && (
+                <ScribSay
+                  {...scribReveal(
+                    p2p.selfId === pair.playerId,
+                    Boolean(snap.votes[pair.playerId]?.[p2p.selfId]),
+                    snap.votes[pair.playerId]?.[p2p.selfId]?.image === answerSide(snap.mode, pair.humanSide),
+                    name,
+                    scribSeed(snap.round, snap.slot, name, "reveal"),
+                  )}
+                />
+              )}
               <h2 className="font-display mt-2 text-2xl leading-none">
                 {snap.mode === "countries"
                   ? `${answerSide(snap.mode, pair.humanSide)} is the real border`
@@ -1478,16 +1733,28 @@ function Room({
             {MODES.find((item) => item.id === snap.mode)?.label} · Round {snap.round}
           </p>
           <h2 className="font-display mt-1 text-4xl leading-none">
-            {snap.mode === "imposter" ? (snap.winner === "humans" ? "Humans win" : "The fake wins") : snap.mode === "team" ? "Humans vs the fake" : "Scores"}
+            {snap.mode === "imposter"
+              ? snap.winner === "humans"
+                ? "Humans win"
+                : "The fake wins"
+              : snap.mode === "blend"
+                ? snap.winner === "humans"
+                  ? "Caught"
+                  : "Blended in"
+                : snap.mode === "team"
+                  ? "Humans vs the fake"
+                  : "Scores"}
           </h2>
           {snap.mode === "imposter" ? (
             <ImposterEnd snap={snap} />
+          ) : snap.mode === "blend" ? (
+            <BlendRecap snap={snap} />
           ) : snap.mode === "team" ? (
             <TeamBoard snap={snap} />
           ) : (
             <Scoreboard snap={snap} selfId={p2p.selfId} />
           )}
-          {snap.mode !== "imposter" && (
+          {snap.mode !== "imposter" && snap.mode !== "blend" && (
           <ul className="mt-3 space-y-1 text-xs text-muted">
             {snap.pairs.map((item) => (
               <li key={item.playerId}>
@@ -1541,17 +1808,218 @@ function Room({
           )}
           </div>
           {host && (
-            <button
-              type="button"
-              onClick={startRound}
-              className="shrink-0 self-start rounded-xl bg-accent px-5 py-3 text-sm font-semibold text-accent-ink"
-            >
-              Next round
-            </button>
+            <div className="shrink-0">
+              {startNote && <p className="mb-2 text-sm text-muted">{startNote}</p>}
+              <button
+                type="button"
+                onClick={startRound}
+                className="rounded-xl bg-accent px-5 py-3 text-sm font-semibold text-accent-ink"
+              >
+                Next round
+              </button>
+            </div>
           )}
         </section>
       )}
     </main>
+  );
+}
+
+function blendPrompt(snap: Snap) {
+  const index = Object.values(snap.topics).find((n) => n >= 0) ?? -1;
+  return index >= 0 ? (PROMPT_LIST[index]?.text ?? "Draw") : "Draw";
+}
+
+function BlendDraw({
+  snap,
+  selfId,
+  timeLeft,
+  lineSent,
+  canvasRef,
+  onDown,
+  onMove,
+  onUp,
+}: {
+  snap: Snap;
+  selfId: string;
+  timeLeft: number;
+  lineSent: boolean;
+  canvasRef: { current: HTMLCanvasElement | null };
+  onDown: (e: React.PointerEvent<HTMLCanvasElement>) => void;
+  onMove: (e: React.PointerEvent<HTMLCanvasElement>) => void;
+  onUp: (e: React.PointerEvent<HTMLCanvasElement>) => void;
+}) {
+  const index = snap.order.length ? snap.slot % snap.order.length : 0;
+  const turn = snap.order[index];
+  const mine = turn?.id === selfId;
+  const knows = (snap.topics[selfId] ?? -1) >= 0;
+  const prompt = knows ? (PROMPT_LIST[snap.topics[selfId] ?? 0]?.text ?? "Draw") : "";
+  return (
+    <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-card border border-line bg-surface p-4">
+      <div className="flex items-end justify-between gap-3">
+        <div>
+          <p className="text-xs tracking-[0.16em] text-muted uppercase">Blend · Round {snap.round}</p>
+          <h2 className="font-display mt-1 text-3xl leading-none">
+            {mine ? "Your line" : `${turn?.name ?? "Someone"}'s line`}
+          </h2>
+          <p className="mt-1 text-sm text-muted">
+            {knows ? prompt : "You don't know the prompt. Make the line fit."}
+          </p>
+        </div>
+        <p className={"font-display text-4xl tabular-nums " + (timeLeft <= 5 ? "text-accent" : "text-fg")}>
+          {formatTime(timeLeft)}
+        </p>
+      </div>
+      <p className="mt-1 text-xs text-muted">
+        {knows ? "Don't say it out loud. " : ""}
+        {mine ? (lineSent ? "Sent." : "One stroke. Lift to send.") : "Watch."}
+      </p>
+      <ol className="mt-2 flex gap-2 overflow-hidden">
+        {snap.order.map((player, i) => (
+          <li
+            key={player.id}
+            className={
+              "shrink-0 rounded-full px-2 py-0.5 text-xs " +
+              (i === index ? "bg-accent text-accent-ink" : "bg-raised text-fg")
+            }
+          >
+            {i + 1}. {player.name}
+            {player.id === selfId ? " · you" : ""}
+          </li>
+        ))}
+      </ol>
+      <canvas
+        ref={canvasRef}
+        width={512}
+        height={512}
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        onPointerCancel={onUp}
+        className={
+          "mt-3 aspect-square w-auto max-w-full min-h-0 flex-1 touch-none self-center rounded-xl border border-line bg-bg " +
+          (mine && !lineSent ? "" : "pointer-events-none")
+        }
+      />
+    </section>
+  );
+}
+
+function BlendVote({
+  snap,
+  selfId,
+  pick,
+  onPick,
+  host,
+  onScores,
+}: {
+  snap: Snap;
+  selfId: string;
+  pick: string | null;
+  onPick: (id: string) => void;
+  host: boolean;
+  onScores: () => void;
+}) {
+  const blind = selfId === snap.blendId;
+  const votesIn = Object.keys(snap.kicks).length;
+  const who = snap.order.find((player) => player.id === snap.blendId);
+  return (
+    <section className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
+      <div className="shrink-0">
+        <p className="text-xs tracking-[0.16em] text-muted uppercase">Blend · Round {snap.round}</p>
+        <h2 className="font-display text-3xl leading-none">
+          {snap.revealed ? (snap.winner === "humans" ? "Caught" : "Blended in") : "Who was blind?"}
+        </h2>
+        <p className="mt-1 text-sm text-muted">{snap.revealed || !blind ? blendPrompt(snap) : "You still don't know it."}</p>
+      </div>
+      {snap.board ? (
+        <img
+          src={snap.board}
+          alt="The drawing"
+          className="mx-auto aspect-square w-full max-w-xs min-h-0 flex-1 rounded-xl border border-line bg-bg object-contain"
+        />
+      ) : (
+        <div className="min-h-0 flex-1 rounded-xl border border-line bg-bg" />
+      )}
+      <div className="flex shrink-0 flex-wrap gap-2">
+        {snap.order.map((player) => {
+          const chosen = (snap.kicks[selfId] ?? pick) === player.id;
+          const mine = player.id === selfId;
+          const votes = snap.revealed ? Object.values(snap.kicks).filter((id) => id === player.id).length : 0;
+          const guilty = snap.revealed && player.id === snap.blendId;
+          return (
+            <button
+              key={player.id}
+              type="button"
+              disabled={snap.revealed || mine}
+              onClick={() => onPick(player.id)}
+              className={
+                "rounded-full px-3 py-2 text-sm " +
+                (guilty || chosen ? "bg-accent text-accent-ink" : "bg-raised text-fg")
+              }
+            >
+              {player.name}
+              {mine ? " · you" : ""}
+              {snap.revealed ? ` · ${votes}` : chosen ? " · vote" : ""}
+            </button>
+          );
+        })}
+      </div>
+      {snap.revealed ? (
+        <div className="shrink-0">
+          <p className="font-display text-2xl leading-none">{who?.name ?? "Someone"} never saw the prompt.</p>
+          <p className="mt-1 text-sm text-muted">
+            {snap.winner === "humans" ? "Caught. A right guess scores 2." : "Not enough votes. The blind player scores 3."}
+          </p>
+          {host ? (
+            <button
+              type="button"
+              onClick={onScores}
+              className="mt-2 rounded-xl bg-accent px-4 py-3 text-sm font-semibold text-accent-ink"
+            >
+              Scores
+            </button>
+          ) : (
+            <p className="mt-2 text-sm text-muted">Waiting for the host.</p>
+          )}
+        </div>
+      ) : (
+        <p className="shrink-0 text-sm text-muted">
+          {votesIn}/{snap.order.length} votes. Not yourself.
+        </p>
+      )}
+    </section>
+  );
+}
+
+function BlendRecap({ snap }: { snap: Snap }) {
+  const who = snap.order.find((player) => player.id === snap.blendId);
+  const ranked = [...snap.order].sort(
+    (a, b) => (snap.scores[b.id] ?? 0) - (snap.scores[a.id] ?? 0) || a.name.localeCompare(b.name),
+  );
+  return (
+    <div className="mt-3">
+      {snap.board ? (
+        <img
+          src={snap.board}
+          alt=""
+          className="mx-auto mb-3 aspect-square w-full max-w-xs rounded-xl border border-line bg-bg object-contain"
+        />
+      ) : null}
+      <p className="text-sm">{who?.name ?? "Someone"} was blending in.</p>
+      <p className="text-sm text-muted">{blendPrompt(snap)}</p>
+      <ol className="mt-3 space-y-2">
+        {ranked.map((player) => (
+          <li key={player.id} className="flex items-center justify-between rounded-2xl bg-bg px-3 py-2">
+            <span>
+              {player.name}
+              {player.id === snap.blendId ? " · blind" : ""}
+            </span>
+            <span className="font-display text-2xl leading-none">{snap.scores[player.id] ?? 0}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 
@@ -1716,21 +2184,8 @@ function TeamBoard({ snap }: { snap: Snap }) {
   const humans = snap.scores[TEAM_KEY] ?? 0;
   const scrib = snap.scores[SCRIB_KEY] ?? 0;
   const ahead = humans === scrib ? "tied" : humans > scrib ? "humans" : "scrib";
-  const lines =
-    ahead === "humans"
-      ? ["The pack is ahead. Rude.", "You're winning as a group. I hate groups.", "Humans in front. I'll fix that."]
-      : ahead === "scrib"
-        ? ["I'm beating every one of you.", "The fake is ahead. Bow a little.", "Teamwork, and you still trail."]
-        : ["Still even. I like my odds.", "Tied. Nobody gets to gloat.", "Even score. I'm patient."];
-  const talk = {
-    mood: ahead === "humans" ? ("glare" as const) : ahead === "scrib" ? ("laugh" as const) : ("smug" as const),
-    line: lines[scribSeed(snap.round, ahead) % lines.length]!,
-  };
   return (
     <>
-      <div className="mt-2">
-        <ScribSay {...talk} />
-      </div>
       <div className="mt-3 grid grid-cols-2 gap-2">
         <div className={"rounded-2xl px-3 py-3 " + (ahead === "humans" ? "bg-accent text-accent-ink" : "bg-bg")}>
           <p className="text-sm">Humans</p>
@@ -1762,9 +2217,11 @@ function Scoreboard({ snap, selfId }: { snap: Snap; selfId: string }) {
   let previous = -1;
   return (
     <>
-      <div className="mt-2">
-        <ScribSay {...talk} />
-      </div>
+      {snap.mode === "classic" && (
+        <div className="mt-2">
+          <ScribSay {...talk} />
+        </div>
+      )}
       <ol className="mt-3 space-y-2">
         {ranked.map((player, index) => {
           const score = snap.scores[player.id] ?? 0;
