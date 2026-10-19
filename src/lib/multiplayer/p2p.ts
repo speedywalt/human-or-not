@@ -39,6 +39,8 @@ export interface PeerInfo {
   candidateType: string | null;
   /** Data-channel ping RTT (ms), measured every 2s once connected. */
   rttMs: number | null;
+  /** Reliable game channel is open and can take a snap. */
+  reliableOpen: boolean;
 }
 
 export interface P2PRoomOptions {
@@ -72,6 +74,8 @@ interface PeerSlot {
   recreatedForOffer?: boolean;
   info: PeerInfo;
   pingSentAt?: number;
+  /** Reliable messages sent before the data channel opened. */
+  outbox: string[];
 }
 
 const FAST_POLL_MS = 400;
@@ -159,12 +163,26 @@ export class P2PRoom {
     const wire = JSON.stringify({ t: "d", d: data });
     const targets = peerId ? [this.peers.get(peerId)] : [...this.peers.values()];
     for (const slot of targets) {
-      if (slot?.reliable?.readyState === "open") slot.reliable.send(wire);
+      if (!slot) continue;
+      this.deliverReliable(slot, wire);
     }
   }
 
   peerList(): PeerInfo[] {
     return [...this.peers.values()].map((s) => ({ ...s.info }));
+  }
+
+  private deliverReliable(slot: PeerSlot, wire: string): void {
+    if (slot.reliable?.readyState === "open") {
+      try {
+        slot.reliable.send(wire);
+        return;
+      } catch {
+        // Channel closed between the check and the send. Hold it.
+      }
+    }
+    slot.outbox.push(wire);
+    if (slot.outbox.length > 24) slot.outbox.shift();
   }
 
   // ── signaling loop ─────────────────────────────────────────────────────────
@@ -261,7 +279,9 @@ export class P2PRoom {
         connectionState: pc.connectionState,
         candidateType: null,
         rttMs: null,
+        reliableOpen: false,
       },
+      outbox: [],
     };
     this.peers.set(peerId, slot);
 
@@ -317,6 +337,16 @@ export class P2PRoom {
     else slot.reliable = channel;
     channel.onopen = () => {
       slot.lastProgressAt = Date.now();
+      if (channel.label !== "state") {
+        slot.info.reliableOpen = true;
+        const queued = slot.outbox.splice(0);
+        for (const wire of queued) this.deliverReliable(slot, wire);
+      }
+      this.emitPeers();
+    };
+    channel.onclose = () => {
+      if (channel.label !== "state") slot.info.reliableOpen = false;
+      this.emitPeers();
     };
     channel.onmessage = (e) => {
       let msg: { t: string; d?: unknown };
@@ -561,7 +591,7 @@ export class P2PRoom {
     // setters otherwise re-render consumers on every poll/ping.
     const list = this.peerList();
     const fingerprint = JSON.stringify(
-      list.map((p) => [p.id, p.name, p.connectionState, p.candidateType, p.rttMs]),
+      list.map((p) => [p.id, p.name, p.connectionState, p.candidateType, p.rttMs, p.reliableOpen]),
     );
     if (fingerprint === this.lastPeersFingerprint) return;
     this.lastPeersFingerprint = fingerprint;

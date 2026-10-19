@@ -1,26 +1,30 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #0e0e12;
-  --color-surface: #17171d;
-  --color-raised: #22222a;
-  --color-fg: #f4efe6;
-  --color-muted: #9a9488;
-  --color-accent: #e8a54b;
-  --color-accent-ink: #1a1206;
-  --color-line: #2c2c34;
-  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
-  --font-display: "Fraunces", ui-serif, Georgia, serif;
-  --radius-card: 1rem;
+  --color-bg: #140f0c;
+  --color-surface: #2a1d14;
+  --color-raised: #3d2b1e;
+  --color-fg: #fff6e8;
+  --color-muted: #d7c4ae;
+  --color-accent: #ffb703;
+  --color-accent-ink: #2a1600;
+  --color-line: #6b5038;
+  --font-sans: "Fredoka", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Lilita One", ui-sans-serif, system-ui, sans-serif;
+  --radius-card: 1.35rem;
 }
 
 @layer base {
   html,
   body {
-    background: var(--color-bg);
+    background:
+      radial-gradient(820px 380px at 50% -120px, rgba(255, 183, 3, 0.28), transparent 62%),
+      radial-gradient(520px 420px at 110% 80%, rgba(255, 90, 48, 0.16), transparent 55%),
+      var(--color-bg);
     color: var(--color-fg);
     font-family: var(--font-sans);
-    min-height: 100%;
+    height: 100%;
+    overflow: hidden;
   }
   button:not(:disabled),
   [role="button"]:not(:disabled) {
@@ -28,5 +32,165 @@
   }
   button:disabled {
     cursor: not-allowed;
+  }
+  button.bg-accent:not(.text-left) {
+    font-family: var(--font-display);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border-radius: 999px;
+    box-shadow: 0 4px 0 #8a5a08;
+  }
+  button.bg-accent:not(.text-left):active {
+    transform: translateY(2px);
+    box-shadow: 0 2px 0 #8a5a08;
+  }
+  .bg-surface {
+    box-shadow: 0 6px 0 #0b0806;
+  }
+}
+
+.ticket {
+  font-family: var(--font-display);
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  box-shadow: 0 4px 0 #8a5a08;
+}
+
+.scrib-face {
+  transform-origin: 50% 90%;
+  animation: scrib-sway 3.4s ease-in-out infinite;
+}
+
+.scribble-words {
+  font-family: "Mynerve", cursive;
+  font-size: 1.35rem;
+  line-height: 1.15;
+}
+
+.scrib-mark {
+  font-family: "Mynerve", cursive;
+  font-size: clamp(4rem, 18vw, 8rem);
+  line-height: 0.8;
+  color: #ffb703;
+  transform: rotate(-8deg);
+  animation: scrib-slash 0.9s ease-out both;
+}
+
+.scrib-scratches {
+  animation: scrib-fade 2.4s ease-in forwards;
+}
+
+.scrib-wander {
+  animation: scrib-wander 2.6s ease-in-out infinite;
+}
+
+.scrib-rage {
+  animation: scrib-rage 0.45s linear infinite;
+}
+
+body.scrib-shake {
+  animation: room-shake 0.12s linear 8;
+}
+
+@keyframes scrib-slash {
+  from {
+    opacity: 0;
+    transform: rotate(-18deg) scale(1.3);
+  }
+  to {
+    opacity: 1;
+    transform: rotate(-8deg) scale(1);
+  }
+}
+
+@keyframes scrib-fade {
+  0% {
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes scrib-wander {
+  0%,
+  100% {
+    transform: translate(0, 0) rotate(-4deg);
+  }
+  50% {
+    transform: translate(28px, 18px) rotate(6deg);
+  }
+}
+
+@keyframes scrib-rage {
+  0% {
+    transform: translate(0, 0) rotate(-8deg);
+  }
+  25% {
+    transform: translate(10px, -8px) rotate(7deg);
+  }
+  50% {
+    transform: translate(-12px, 6px) rotate(-10deg);
+  }
+  75% {
+    transform: translate(8px, 10px) rotate(5deg);
+  }
+  100% {
+    transform: translate(0, 0) rotate(-8deg);
+  }
+}
+
+@keyframes room-shake {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  25% {
+    transform: translate(-5px, 2px);
+  }
+  50% {
+    transform: translate(6px, -3px);
+  }
+  75% {
+    transform: translate(-3px, -2px);
+  }
+}
+
+.scrib-in {
+  animation: scrib-in 0.4s ease-out;
+}
+
+.scrib-out {
+  animation: scrib-out 0.6s ease-in forwards;
+}
+
+@keyframes scrib-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) rotate(-6deg);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes scrib-out {
+  to {
+    opacity: 0;
+    transform: translateY(22px) rotate(8deg);
+  }
+}
+
+@keyframes scrib-sway {
+  0%,
+  100% {
+    transform: rotate(-2deg);
+  }
+  50% {
+    transform: rotate(3deg);
   }
 }
